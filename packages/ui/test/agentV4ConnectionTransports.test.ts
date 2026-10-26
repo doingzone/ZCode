@@ -14,7 +14,7 @@ import {
   encodeTopicWireFrames,
   utf8JsonByteLength,
 } from "@zcode/shared/zcode-protocol-v4";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentConversationTransport } from "../src/v4/agentConversationTransport.js";
 import { createAgentSessionsIndexTransport } from "../src/v4/agentSessionsIndexTransport.js";
 import { ensureAgentV4ConnectionHandshake } from "../src/v4/agentV4ConnectionHandshake.js";
@@ -1230,4 +1230,48 @@ it("校准过期后收到 CLI 检查点或内容帧会重新探测时钟，有�
     off();
     setLocalTtftObserver(undefined);
   }
+});
+
+describe("v4 handshake/subscribe 超时保护（host 冻结场景）", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("host 永不返回 ACK 时订阅按超时失败，且失败后可立即重试", async () => {
+    const agent = setupAgent();
+    agent.subscribeConversationV4 = vi.fn(
+      () => new Promise(() => {}),
+    ) as unknown as typeof agent.subscribeConversationV4;
+    const transport = createAgentConversationTransport(agent as never, { workspacePath: "/work" });
+    const pending = transport.subscribe({ topic: "conversation/session-frozen-host" });
+    const assertion = expect(pending).rejects.toThrow("fault.subscription.hostUnresponsive");
+    await vi.advanceTimersByTimeAsync(60_000);
+    await assertion;
+    expect(agent.subscribeConversationV4).toHaveBeenCalledOnce();
+    // host 恢复后（这里用正常 mock 模拟），重试直接成功
+    agent.subscribeConversationV4 = setupAgent().subscribeConversationV4;
+    await expect(
+      transport.subscribe({ topic: "conversation/session-frozen-host" }),
+    ).resolves.toMatchObject({ ack: { subscriptionId: "sub-conversation" } });
+  });
+
+  it("握手超时后 memo 失效，下一次调用会重新发起 hello", async () => {
+    const agent = setupAgent();
+    agent.helloConversationV4 = vi.fn(
+      () => new Promise(() => {}),
+    ) as unknown as typeof agent.helloConversationV4;
+    const firstAssertion = expect(ensureAgentV4ConnectionHandshake(agent as never)).rejects.toThrow(
+      "fault.handshake.hostUnresponsive",
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    await firstAssertion;
+    agent.helloConversationV4 = setupAgent().helloConversationV4;
+    await expect(ensureAgentV4ConnectionHandshake(agent as never)).resolves.toMatchObject({
+      kind: "hello",
+    });
+    expect(agent.helloConversationV4).toHaveBeenCalledOnce();
+  });
 });

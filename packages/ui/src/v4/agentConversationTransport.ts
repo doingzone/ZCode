@@ -35,6 +35,7 @@ import {
 } from "@zcode/shared/zcode-protocol-v4";
 import type { ConversationTransport } from "@/v4/transport.js";
 import { ensureAgentV4ConnectionHandshake } from "@/v4/agentV4ConnectionHandshake.js";
+import { raceV4Timeout } from "@/v4/v4Timeout.js";
 import { createWorkflowRunTransportMethods } from "@/v4/agentConversationTransportWorkflowRuns.js";
 import { createAckActivationBarrier } from "@/v4/ackActivationBarrier.js";
 import { createTopicWireDecoder } from "@/v4/topicWireDecoder.js";
@@ -43,6 +44,8 @@ import {
   uploadAttachmentTransaction,
   type AttachmentUploadOptions,
 } from "@/v4/attachmentUploadTransaction.js";
+
+const SUBSCRIBE_TIMEOUT_MS = 60_000;
 
 export interface AgentConversationTransportTarget {
   workspacePath: string;
@@ -204,15 +207,23 @@ export function createAgentConversationTransport(
         await ensureHandshake();
         pending = barrier.begin(params.topic);
         const subscribeRuntimeGeneration = runtimeGeneration;
-        const result = await agentService.subscribeConversationV4({
-          ...workspace,
-          sessionId,
-          ...(params.base ? { base: params.base } : {}),
-          ...(params.visibility ? { visibility: params.visibility } : {}),
-          ...(params.retryInitialization
-            ? { retryInitialization: params.retryInitialization }
-            : {}),
-        });
+        // host 冻结时该 RPC 永不返回；不设超时的话订阅 promise 永久悬挂，
+        // 连下面的 catch/subscribe.failed 日志都不会走到，会话面板永久空白。
+        // 合法冷订阅（远程 WSL 工作区首开）实测可达 22.7s，60s 留足余量；
+        // 超时后走 catch 的 barrier.cancel + subscribe.failed，UI 可以重试。
+        const result = await raceV4Timeout(
+          agentService.subscribeConversationV4({
+            ...workspace,
+            sessionId,
+            ...(params.base ? { base: params.base } : {}),
+            ...(params.visibility ? { visibility: params.visibility } : {}),
+            ...(params.retryInitialization
+              ? { retryInitialization: params.retryInitialization }
+              : {}),
+          }),
+          SUBSCRIBE_TIMEOUT_MS,
+          "fault.subscription.hostUnresponsive",
+        );
         if (subscribeRuntimeGeneration !== runtimeGeneration) {
           // 旧 runtime 的迟到 ACK 可能复用新 runtime 的 subId；此处只能
           // 丢本地 pending，不能向新 runtime 盲退订同名 subscription。
